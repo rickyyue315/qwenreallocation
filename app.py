@@ -95,119 +95,152 @@ def calculate_transfer_suggestions(df):
         summary_stats['articles_count'].add(article)
         summary_stats['oms_count'].add(om)
         
-        # 识别转出店铺
-        sources = []
+        # 创建一个可变的组数据副本来跟踪库存变化
+        group_state = group.copy()
+        # 初始化可用数量和需求
+        group_state['Available Qty'] = group_state['SaSa Net Stock'] + group_state['Pending Received']
+        group_state['Excess Qty'] = np.maximum(group_state['Available Qty'] - group_state['Safety Stock'], 0)
+        group_state['Needed Qty'] = np.maximum(group_state['Safety Stock'] - group_state['Available Qty'], 0)
         
-        # 优先级1: ND类型转出
-        nd_sources = group[group['RP Type'] == 'ND'].copy()
-        nd_sources['Transferable Qty'] = nd_sources['SaSa Net Stock']
-        for _, row in nd_sources.iterrows():
-            sources.append({
-                'Site': row['Site'],
-                'Type': 'ND',
-                'Qty': row['Transferable Qty'],
-                'Priority': 1,
-                'Row': row  # 保存行数据以获取Product Desc等信息
-            })
-        
-        # 优先级2: RF类型过剰转出
-        rf_group = group[group['RP Type'] == 'RF'].copy()
-        if not rf_group.empty:
-            rf_group['Available Qty'] = rf_group['SaSa Net Stock'] + rf_group['Pending Received']
-            rf_group['Excess'] = rf_group['Available Qty'] - rf_group['Safety Stock']
-            # 找出销量不是最高的店铺
-            max_sold = rf_group['Effective Sold Qty'].max() if not rf_group.empty else 0
-            rf_sources = rf_group[(rf_group['Excess'] > 0) & (rf_group['Effective Sold Qty'] < max_sold)]
+        # 持续进行匹配直到无法再匹配
+        while True:
+            # 重新计算所有店铺的状态
+            group_state['Available Qty'] = group_state['SaSa Net Stock'] + group_state['Pending Received']
+            group_state['Excess Qty'] = np.maximum(group_state['Available Qty'] - group_state['Safety Stock'], 0)
+            group_state['Needed Qty'] = np.maximum(group_state['Safety Stock'] - group_state['Available Qty'], 0)
             
-            for _, row in rf_sources.iterrows():
-                sources.append({
-                    'Site': row['Site'],
-                    'Type': 'RF',
-                    'Qty': row['Excess'],
-                    'Priority': 2,
-                    'Row': row  # 保存行数据
-                })
-        
-        # 识别接收店铺
-        destinations = []
-        
-        # 优先级1: 紧急缺货补货
-        urgent_destinations = rf_group[
-            (rf_group['SaSa Net Stock'] == 0) & 
-            (rf_group['Effective Sold Qty'] > 0)
-        ].copy()
-        urgent_destinations['Needed Qty'] = urgent_destinations['Safety Stock']
-        
-        for _, row in urgent_destinations.iterrows():
-            destinations.append({
-                'Site': row['Site'],
-                'Priority': 1,
-                'Qty': row['Needed Qty'],
-                'Type': 'Urgent',
-                'Row': row  # 保存行数据
-            })
-        
-        # 优先级2: 潜在缺货补货
-        # 找出销量最高的店铺
-        if not rf_group.empty:
-            max_sold = rf_group['Effective Sold Qty'].max()
-            potential_destinations = rf_group[
-                ((rf_group['SaSa Net Stock'] + rf_group['Pending Received']) < rf_group['Safety Stock']) &
-                (rf_group['Effective Sold Qty'] == max_sold)
-            ].copy()
-            potential_destinations['Needed Qty'] = (
-                potential_destinations['Safety Stock'] - 
-                (potential_destinations['SaSa Net Stock'] + potential_destinations['Pending Received'])
-            )
+            # 识别转出店铺
+            sources = []
             
-            for _, row in potential_destinations.iterrows():
-                destinations.append({
-                    'Site': row['Site'],
-                    'Priority': 2,
-                    'Qty': row['Needed Qty'],
-                    'Type': 'Potential',
-                    'Row': row  # 保存行数据
-                })
-        
-        # 执行匹配
-        sources_sorted = sorted(sources, key=lambda x: (x['Priority'], -x['Qty']))
-        destinations_sorted = sorted(destinations, key=lambda x: (x['Priority'], -x['Qty']))
-        
-        # 匹配逻辑
-        for source in sources_sorted:
-            if source['Qty'] <= 0:
-                continue
+            # 优先级1: ND类型转出
+            nd_sources = group_state[group_state['RP Type'] == 'ND'].copy()
+            for _, row in nd_sources.iterrows():
+                if row['SaSa Net Stock'] > 0:  # 只有有净库存才可转出
+                    sources.append({
+                        'Site': row['Site'],
+                        'Type': 'ND',
+                        'Qty': row['SaSa Net Stock'],  # ND类型转出全部净库存
+                        'Priority': 1,
+                        'Row': row,
+                        'Index': row.name  # 保存原始索引以更新group_state
+                    })
+            
+            # 优先级2: RF类型过剰转出
+            rf_group = group_state[group_state['RP Type'] == 'RF'].copy()
+            if not rf_group.empty:
+                # 找出销量不是最高的店铺
+                max_sold = rf_group['Effective Sold Qty'].max() if not rf_group.empty else 0
+                rf_sources = rf_group[(rf_group['Excess Qty'] > 0) & (rf_group['Effective Sold Qty'] < max_sold)]
                 
-            for dest in destinations_sorted:
-                if dest['Qty'] <= 0:
+                for _, row in rf_sources.iterrows():
+                    sources.append({
+                        'Site': row['Site'],
+                        'Type': 'RF',
+                        'Qty': row['Excess Qty'],
+                        'Priority': 2,
+                        'Row': row,
+                        'Index': row.name
+                    })
+            
+            # 识别接收店铺
+            destinations = []
+            
+            # 优先级1: 紧急缺货补货
+            urgent_destinations = rf_group[
+                (rf_group['SaSa Net Stock'] == 0) & 
+                (rf_group['Effective Sold Qty'] > 0)
+            ].copy()
+            
+            for _, row in urgent_destinations.iterrows():
+                if row['Safety Stock'] > 0:  # 只有有安全库存需求才需要补货
+                    destinations.append({
+                        'Site': row['Site'],
+                        'Priority': 1,
+                        'Qty': row['Safety Stock'],  # 需要补足到安全库存
+                        'Type': 'Urgent',
+                        'Row': row,
+                        'Index': row.name
+                    })
+            
+            # 优先级2: 潜在缺货补货
+            # 找出销量最高的店铺
+            if not rf_group.empty:
+                max_sold = rf_group['Effective Sold Qty'].max()
+                potential_destinations = rf_group[
+                    (rf_group['Needed Qty'] > 0) &
+                    (rf_group['Effective Sold Qty'] == max_sold)
+                ].copy()
+                
+                for _, row in potential_destinations.iterrows():
+                    destinations.append({
+                        'Site': row['Site'],
+                        'Priority': 2,
+                        'Qty': row['Needed Qty'],
+                        'Type': 'Potential',
+                        'Row': row,
+                        'Index': row.name
+                    })
+            
+            # 如果没有可匹配的源或目标，退出循环
+            if not sources or not destinations:
+                break
+                
+            # 按优先级排序
+            sources_sorted = sorted(sources, key=lambda x: (x['Priority'], -x['Qty']))
+            destinations_sorted = sorted(destinations, key=lambda x: (x['Priority'], -x['Qty']))
+            
+            # 标记是否进行了匹配
+            matched = False
+            
+            # 匹配逻辑 - 严格按顺序匹配，每次只进行一次匹配
+            for source in sources_sorted:
+                if source['Qty'] <= 0:
                     continue
                     
-                if source['Site'] == dest['Site']:
-                    continue  # 不能自己调给自己
+                for dest in destinations_sorted:
+                    if dest['Qty'] <= 0:
+                        continue
+                        
+                    if source['Site'] == dest['Site']:
+                        continue  # 不能自己调给自己
                     
-                transfer_qty = min(source['Qty'], dest['Qty'])
-                
-                if transfer_qty > 0:
-                    # 添加建议记录
-                    product_desc = source['Row']['Product Desc'] if 'Product Desc' in source['Row'] else ''
+                    # 确定转移数量
+                    transfer_qty = min(source['Qty'], dest['Qty'])
                     
-                    transfer_suggestions.append({
-                        'Article': article,
-                        'Product Desc': product_desc,
-                        'OM': om,
-                        'Transfer Site': source['Site'],
-                        'Receive Site': dest['Site'],
-                        'Transfer Qty': transfer_qty,
-                        'Notes': f"转出类型: {source['Type']}, 接收优先级: {dest['Priority']}"
-                    })
-                    
-                    # 更新统计
-                    summary_stats['total_transfers'] += 1
-                    summary_stats['total_qty'] += transfer_qty
-                    
-                    # 更新剩余数量
-                    source['Qty'] -= transfer_qty
-                    dest['Qty'] -= transfer_qty
+                    if transfer_qty > 0:
+                        # 添加建议记录
+                        product_desc = source['Row']['Product Desc'] if 'Product Desc' in source['Row'] else ''
+                        
+                        transfer_suggestions.append({
+                            'Article': article,
+                            'Product Desc': product_desc,
+                            'OM': om,
+                            'Transfer Site': source['Site'],
+                            'Receive Site': dest['Site'],
+                            'Transfer Qty': transfer_qty,
+                            'Notes': f"转出类型: {source['Type']}, 接收优先级: {dest['Priority']}"
+                        })
+                        
+                        # 更新统计
+                        summary_stats['total_transfers'] += 1
+                        summary_stats['total_qty'] += transfer_qty
+                        
+                        # 关键：更新group_state中的库存数据，防止重复调货
+                        # 更新转出店铺的库存
+                        group_state.loc[source['Index'], 'SaSa Net Stock'] -= transfer_qty
+                        
+                        # 更新接收店铺的库存
+                        group_state.loc[dest['Index'], 'SaSa Net Stock'] += transfer_qty
+                        
+                        # 标记已进行匹配，需要重新计算并继续循环
+                        matched = True
+                        break
+                if matched:
+                    break
+            
+            # 如果本轮没有进行任何匹配，退出循环
+            if not matched:
+                break
     
     return transfer_suggestions, summary_stats
 
@@ -247,7 +280,7 @@ if uploaded_file is not None:
         st.success("✅ Excel文件读取成功")
         
         # 显示原始数据信息
-        with st.expander("看查看原始数据信息"):
+        with st.expander("望原始数据信息"):
             st.write(f"数据形状: {df.shape}")
             st.write("列名:", df.columns.tolist())
             st.dataframe(df.head())
